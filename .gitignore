@@ -10,4 +10,6 @@ __pycache__/
 # VS Code
 .vscode/
 
-teslaTemp
+dummy.py
+
+temp
