@@ -3,6 +3,7 @@ import re
 from Cable import Cable
 from Upload_Data import process_csv
 import pandas as pd
+import numpy as np
 
 import plotly.express as px
 
@@ -68,19 +69,73 @@ def DCR_continuity_histograms(master_failures):
     #2nd and 3rd will display all the channels and the number of failures on each one -- of each category
 
 
-        
+def generate_leakage_histograms(master_df):
+    
+    max_edge = 10000 
+    bin_size = 200 
+    threshold = 2000
+    values_df = master_df.drop(columns=["Channel"], errors="ignore").copy()
+    values_df = values_df.apply(pd.to_numeric, errors="coerce")
 
-def classify_reason(detail: str) -> str:
-    text = detail.lower()
+    
+    col_max = values_df.max(axis=0, skipna=True)
+    col_max = col_max.replace([np.inf, -np.inf], np.nan).dropna()
 
-    if "shorted" in text:
-        return "Shorted"
-    if "miswire" in text:
-        return "Miswire"
-    if "high" in text:
-        return "High"
+    all_vals = values_df.to_numpy().ravel()
+    all_vals = all_vals[np.isfinite(all_vals)]
+    all_vals = all_vals[~np.isnan(all_vals)]
 
-    return "Other"
+    edges = np.arange(0, max_edge + bin_size, bin_size)
+    labels = [f"{int(edges[i])}-{int(edges[i+1])}" for i in range(len(edges) - 1)]
+    labels.append(f"{int(max_edge)}+")
+
+    
+    max_df = pd.DataFrame({"cable": col_max.index, "value": col_max.values})
+    max_df["bin"] = pd.cut(max_df["value"], bins=list(edges) + [np.inf],
+                           labels=labels, right=False)
+
+    all_df = pd.DataFrame({"value": all_vals})
+    all_df["bin"] = pd.cut(all_df["value"], bins=list(edges) + [np.inf],
+                           labels=labels, right=False)
+
+
+
+    fig_max = px.histogram(
+        max_df,
+        x="bin",
+        category_orders={"bin": labels},
+        title=f"Max Leakage per Cable (bin={int(bin_size)})",
+        labels={"bin": "Leakage Range"}
+    )
+    fig_max.update_layout(xaxis_title="Maximum Leakage", template="plotly_white")
+
+
+    fig_all = px.histogram(
+        all_df,
+        x="bin",
+        category_orders={"bin": labels},
+        title=f"All Leakage Values (bin={int(bin_size)})",
+        labels={"bin": "Leakage Range"}
+    )
+    fig_all.update_layout(xaxis_title="Leakage", template="plotly_white")
+
+
+    if threshold is not None:
+        # Determine which categorical index to target:
+        if threshold >= max_edge:
+            vline_x = len(labels) - 1  # overflow bin
+        else:
+            vline_x = int(np.floor(threshold / bin_size))
+        for fig in (fig_max, fig_all):
+            fig.add_vline(
+                x=vline_x,
+                line_dash="dash",
+                line_color="red",
+                annotation_text=f"{int(threshold)}",
+                annotation_position="top right",
+            )
+
+    return fig_max, fig_all
 
         
 def create_cable(cable_length, serial_number):
@@ -225,6 +280,13 @@ if uploaded_files:
     with Continuity_Tab:
         st.subheader("Continuity")
         st.divider()
+        has_continuity = any(
+            getattr(cable, "continuity", None) is not None
+            and not getattr(cable.continuity, "empty", True)
+            for cable in cables
+        )
+        if(has_continuity):
+            continuity_master = build_master_dataframe(cables, "continuity")[0]
         #generate failure table 
         continuity_master_failures = []
         for cable in cables.values():
@@ -251,13 +313,7 @@ if uploaded_files:
 
         #generate master csv etc 
 
-        has_continuity = any(
-            getattr(cable, "continuity", None) is not None
-            and not getattr(cable.continuity, "empty", True)
-            for cable in cables
-        )
-        if(has_continuity):
-            continuity_master = build_master_dataframe(cables, "continuity")
+
 
 
         COL_LAYOUT = [1, 1, 5, 1]
@@ -305,6 +361,13 @@ if uploaded_files:
     with Inverse_Continuity_Tab:
         st.subheader("Inverse Continuity")
         st.divider()
+        has_inverse_continuity = any(
+            getattr(cable, "inv_continuity", None) is not None
+            and not getattr(cable.inv_continuity, "empty", True)
+            for cable in cables
+        )
+        if(has_inverse_continuity):
+            continuity_master = build_master_dataframe(cables, "inv_continuity")[0]
         inverse_continuity_master_failures = []
         for cable in cables.values():
             fail_df = cable.inv_continuity_errors
@@ -330,14 +393,7 @@ if uploaded_files:
         if "inverse_continuity_figs" not in st.session_state:
             st.session_state.inverse_continuity_figs = {}
         #generate master csv etc 
-        #continuity_master = build_master_dataframe(cables, "continuity")
-        has_inverse_continuity = any(
-            getattr(cable, "inv_continuity", None) is not None
-            and not getattr(cable.inv_continuity, "empty", True)
-            for cable in cables
-        )
-        if(has_inverse_continuity):
-            continuity_master = build_master_dataframe(cables, "inv_continuity")
+
 
         COL_LAYOUT = [1, 1, 5, 1]
         st.subheader("Processed Cables")
@@ -382,7 +438,13 @@ if uploaded_files:
                 fig_slot.plotly_chart(stored_fig, use_container_width=True, key=f"inverse_continuity_fig{cable.serial_number}")
     with DCR_Tab:
         st.subheader("DC Resistance")
-        
+        has_DCR = any(
+            getattr(cable, "resistance", None) is not None
+            and not getattr(cable.resistance, "empty", True)
+            for cable in cables
+        )
+        if(has_DCR):
+            DCR_master = build_master_dataframe(cables, "resistance")[0]
         dcr_master_failures = []
         for cable in cables.values():
             fail_df = cable.resistance_errors
@@ -410,13 +472,7 @@ if uploaded_files:
         if "DCR_figs" not in st.session_state:
             st.session_state.DCR_figs = {}
         #create histogram of failure type
-        has_DCR = any(
-            getattr(cable, "resistance", None) is not None
-            and not getattr(cable.resistance, "empty", True)
-            for cable in cables
-        )
-        if(has_DCR):
-            DCR_master = build_master_dataframe(cables, "resistance")
+
 
         COL_LAYOUT = [1, 1, 5, 1]
         st.subheader("Processed Cables")
@@ -458,6 +514,13 @@ if uploaded_files:
                 fig_slot.plotly_chart(stored_fig, use_container_width=True,key=f"DCR_fig{cable.serial_number}")
     with Inverse_DCR_Tab:
         st.subheader("Inverse DC Resistance")
+        has_inverse_DCR = any(
+            getattr(cable, "inv_resistance", None) is not None
+            and not getattr(cable.inv_resistance, "empty", True)
+            for cable in cables
+        )
+        if(has_inverse_DCR):
+            inverse_DCR_master = build_master_dataframe(cables, "inv_resistance")[0]
         #generate master csv 
         inverse_dcr_master_failures = []
         for cable in cables.values():
@@ -484,13 +547,7 @@ if uploaded_files:
         #create tables of failures 
         #create histogram of failure type
         st.divider()
-        has_inverse_DCR = any(
-            getattr(cable, "inv_resistance", None) is not None
-            and not getattr(cable.inv_resistance, "empty", True)
-            for cable in cables
-        )
-        if(has_inverse_DCR):
-            inverse_DCR_master = build_master_dataframe(cables, "inv_resistance")
+
         COL_LAYOUT = [1, 1, 5, 1]
         st.subheader("Processed Cables")
         header_cols = st.columns(COL_LAYOUT)
@@ -532,8 +589,25 @@ if uploaded_files:
             if stored_fig is not None:
                 fig_slot.plotly_chart(stored_fig, use_container_width=True, key=f"inverse_DCR_fig{cable.serial_number}")
     with Leakage_1s_Tab:
+        leakage_1s_master_failures = []
         # add the "master" histograms from before
         st.subheader("1s Leakage")
+        for cable in cables.values():
+            fail_df = cable.leakage_1s_errors
+            if cable.leakage_1s is not None:
+                if fail_df is not None and not fail_df.empty:
+                    leakage_1s_master_failures.append(fail_df.copy())
+        gen_master = any(c.leakage_1s is not None and not c.leakage_1s.empty for c in cables.values())        
+        if(gen_master):
+            master_df = build_master_dataframe(cables, "leakage_1s")[0]
+            print(master_df)
+            fig_overall, fig_stacked = generate_leakage_histograms(master_df)
+
+            st.subheader("1s leakage Summary")
+            st.plotly_chart(fig_overall, use_container_width=True)
+            st.plotly_chart(fig_stacked, use_container_width=True)
+
+            st.divider()
         #leakage 1s heatmap and master dataframe    st.divider()
         COL_LAYOUT = [1, 1, 5, 1]
         st.subheader("Processed Cables")
@@ -542,8 +616,7 @@ if uploaded_files:
             and not getattr(cable.leakage_1s, "empty", True)
             for cable in cables
         )
-        if(has_leakage_1s):
-            leakage_1s_master = build_master_dataframe(cables, "leakage_1s")
+
         if "leakage_1s_figs" not in st.session_state:
             st.session_state.leakage_1s_figs = {}
         header_cols = st.columns(COL_LAYOUT)
@@ -556,14 +629,7 @@ if uploaded_files:
         leakage_1s_master_failures = []
         for cable in cables.values():
             cols = st.columns(COL_LAYOUT)
-            fail_df = cable.leakage_1s_errors      
             has_df = (cable.leakage_1s is not None)            
-            if(has_df):
-                if(fail_df is not None and not fail_df.empty):
-                    fail_df = fail_df.copy()
-                    leakage_1s_master_failures.append(fail_df)
-            else:
-                continue
             fig_slot = cols[2].container()
 
             if(has_df):
@@ -600,13 +666,24 @@ if uploaded_files:
         #add the "master" histograms from before using the same logic
         st.subheader("Final Leakage")
         st.divider()
-        has_leakage = any(
-            getattr(cable, "leakage", None) is not None
-            and not getattr(cable.leakage, "empty", True)
-            for cable in cables
-        )
-        if(has_leakage):
-            leakage_master = build_master_dataframe(cables, "leakage")
+        for cable in cables.values():
+            fail_df = cable.leakage_1s_errors
+            if cable.leakage_1s is not None:
+                if fail_df is not None and not fail_df.empty:
+                    leakage_1s_master_failures.append(fail_df.copy())
+        gen_master = any(c.leakage is not None and not c.leakage.empty for c in cables.values())        
+        if(gen_master):
+            master_df = build_master_dataframe(cables, "leakage")[0]
+            print(type(master_df))
+            print(master_df)
+            fig_overall, fig_stacked = generate_leakage_histograms(master_df)
+
+            st.subheader("leakage Summary")
+            st.plotly_chart(fig_overall, use_container_width=True)
+            st.plotly_chart(fig_stacked, use_container_width=True)
+
+            st.divider()
+
         COL_LAYOUT = [1, 1, 5, 1]
         st.subheader("Processed Cables")
         
@@ -624,15 +701,8 @@ if uploaded_files:
         final_leakage_failures = []
         for cable in cables.values():
             cols = st.columns(COL_LAYOUT)
-            fail_df = cable.leakage_errors      
             has_df = (cable.leakage is not None)            
   
-            if has_df:
-                if(fail_df is not None and not fail_df.empty):
-                    fail_df = fail_df.copy()
-                    final_leakage_failures.append(fail_df)
-            else:
-                continue
             fig_slot = cols[2].container()
 
             if(has_df):
