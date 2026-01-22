@@ -5,6 +5,10 @@ from Upload_Data import process_csv
 import pandas as pd
 import numpy as np
 
+from pathlib import Path
+
+import os, tempfile
+
 import plotly.express as px
 
 
@@ -161,13 +165,19 @@ def has_data(cables, test_type: str) -> bool:
         elif(test_type == "continuity"):
             if(cable.continuity is not None):
                 return True
+        elif(test_type == "inv_DCR"):
+            if(cable.inv_resistance is not None):
+                return True
+        elif(test_type == "inv_continuity"):
+            if(cable.inv_continuity is not None):
+                return True
     return False
 
 # bring the histogram stuff over from the other site for leakage 
 
 # create a graph for DCR failures -- reason from the failure dataframe 
 # same for continuity 
-# download master csv for all forms of test 
+# Download master csv for all forms of test 
 # do we want like a max resistance section or anything like how we have max leakage 
 # make new tabs for inv_resistance and inv_continuity
 def build_master_dataframe(
@@ -279,14 +289,19 @@ if uploaded_files:
 
     with Continuity_Tab:
         st.subheader("Continuity")
-        st.divider()
-        has_continuity = any(
-            getattr(cable, "continuity", None) is not None
-            and not getattr(cable.continuity, "empty", True)
-            for cable in cables
-        )
+        has_continuity = has_data(cables, "continuity")
         if(has_continuity):
             continuity_master = build_master_dataframe(cables, "continuity")[0]
+            csv_str = continuity_master.to_csv(index=False)
+            st.download_button(
+                label="Download Master Continuity CSV",
+                data=csv_str,
+                file_name="continuity_master.csv",
+                mime="text/csv",
+                key="download_continuity_csv",
+            )
+        st.divider()
+
         #generate failure table 
         continuity_master_failures = []
         for cable in cables.values():
@@ -294,36 +309,41 @@ if uploaded_files:
             if cable.continuity is not None:
                 if fail_df is not None and not fail_df.empty:
                     continuity_master_failures.append(fail_df.copy())
+
+            
+            if fail_df is not None:
+                cat_df = cable.map_defects_to_order(fail_df)
+                discrete_fig = cable.category_heatmap(cat_df)
+                #st.plotly_chart(discrete_fig, use_container_width=True)
                     
         if continuity_master_failures:
+
             master_df = pd.concat(continuity_master_failures, ignore_index=True)
-
-
             master_df["Category"] = master_df["Detail"].apply(bucket_reason)
             fig_overall, fig_stacked = DCR_continuity_histograms(master_df)
 
             st.subheader("Continuity Failure Summary")
             st.plotly_chart(fig_overall, use_container_width=True)
             st.plotly_chart(fig_stacked, use_container_width=True)
-
             st.divider()
 
+
         if "continuity_figs" not in st.session_state:
-            st.session_state.continuity_figs = {}
-
-        #generate master csv etc 
-
-
-
-
-        COL_LAYOUT = [1, 1, 5, 1]
+            st.session_state.continuity_figs = {}  # numeric heatmaps per serial_number
+        if "continuity_defect_figs" not in st.session_state:
+            st.session_state.continuity_defect_figs = {}
+        COL_LAYOUT = [1, 1, 4, 4, 1.5]  # SN | Length | Heatmap | Defect Map | Download
         st.subheader("Processed Cables")
+
+        header_cols = st.columns(COL_LAYOUT)
 
         header_cols = st.columns(COL_LAYOUT)
         header_cols[0].markdown("**Serial Number**")
         header_cols[1].markdown("**Length (in)**")
         header_cols[2].markdown("**Heatmap**")
-        header_cols[3].markdown("**Download CSV**")
+        header_cols[3].markdown("**Defect Map**")
+        header_cols[4].markdown("**Download CSV**")
+
         #find all the cables with continuity data and create the buttons for the heatmap data
         # generate the master dataframe so histogram can be made etc 
 
@@ -332,262 +352,524 @@ if uploaded_files:
             cols = st.columns(COL_LAYOUT)
             has_df = (cable.continuity is not None)            
 
-            fig_slot = cols[2].container()
+
+            heat_fig_slot = cols[2].container()
+            defect_fig_slot = cols[3].container()
 
             if(has_df):
                 cols[0].markdown(cable.serial_number)
                 cols[1].markdown(cable.length)
-                fig_exists = cable.serial_number in st.session_state.continuity_figs
-                if(not fig_exists):
+                
+                heatmap_exists = cable.serial_number in st.session_state.continuity_figs
+                if not heatmap_exists:
                     if cols[2].button(
                         "Generate Heatmap",
                         key=f"continuity_heatmap_{cable.serial_number}",
                     ):
-                        #continuity _ heatmap 
                         fig = cable.continuity_heatmap("forward")
                         st.session_state.continuity_figs[cable.serial_number] = fig
+                        # Immediately display it
+                        heat_fig_slot.plotly_chart(fig, use_container_width=True)
                 else:
-                    cols[2].markdown("<span style='color:gray'>Heatmap generated ✔</span>", unsafe_allow_html=True)
-                if cols[3].button(
-                    "download csv",
-                    key=f"continuity_csv_{cable.serial_number}",
-                ):
-                    print("hello world")
-                
+                    cols[2].markdown(
+                        "<span style='color:gray'>Heatmap generated ✔</span>",
+
+                    unsafe_allow_html=True
+                )
+
+                stored_heat = st.session_state.continuity_figs.get(cable.serial_number)
+                if stored_heat is not None:
+                    heat_fig_slot.plotly_chart(stored_heat, use_container_width=True, key=f"continuity_heat_{cable.serial_number}")
+
+                    
+                defect_exists = cable.serial_number in st.session_state.continuity_defect_figs
+                if not defect_exists:
+                    if cols[3].button(
+                        "Generate Defect Map",
+                        key=f"continuity_defect_{cable.serial_number}",
+                    ):
+                        fail_df = getattr(cable, "continuity_errors", None)
+                        if fail_df is None:
+                            # Allow blank category map if no failures yet
+                            fail_df = pd.DataFrame(columns=["Channel", "Detail"])
+
+                        cat_df = cable.map_defects_to_order(fail_df)  # returns ["Channel","Category"]
+                        defect_fig = cable.category_heatmap(cat_df)
+                        st.session_state.continuity_defect_figs[cable.serial_number] = defect_fig
+                        # Immediately display it
+                        defect_fig_slot.plotly_chart(defect_fig, use_container_width=True)
+                else:
+                    cols[3].markdown(
+                        "<span style='color:gray'>Defect map generated ✔</span>",
+                        unsafe_allow_html=True
+                    )
+
+                    stored_defect = st.session_state.continuity_defect_figs.get(cable.serial_number)
+                    if stored_defect is not None:
+                        defect_fig_slot.plotly_chart(stored_defect, use_container_width=True, key=f"continuity_defect_{cable.serial_number}")
+
+
+                safe_sn = str(cable.serial_number).strip()
+                safe_len = str(int(cable.length)) if isinstance(cable.length, (int, float)) else str(cable.length).strip()
+
+                base_dir = Path("temp") / safe_len / safe_sn
+                name = f"continuity_{safe_len}_{safe_sn}.csv"
+                temp_path = base_dir / name
+                                    
+                if temp_path.exists():
+                    csv_bytes = temp_path.read_bytes()
+                    cols[4].download_button(
+                        label="Download CSV",
+                        data=csv_bytes,
+                        file_name=name,    # user-facing filename
+                        mime="text/csv",
+                        key=f"continuity_csv_{cable.serial_number}",
+                    )
+                else:
+                    cols[4].markdown(
+                        "<span style='color:crimson'>Missing temp file</span>",
+                        unsafe_allow_html=True
+                    )
+
         
-        stored_fig = st.session_state.continuity_figs.get(cable.serial_number)
-        if stored_fig is not None:
-            fig_slot.plotly_chart(stored_fig, use_container_width=True, key = f"continuity_fig{cable.serial_number}")
+            stored_fig = st.session_state.continuity_figs.get(cable.serial_number)
     with Inverse_Continuity_Tab:
         st.subheader("Inverse Continuity")
+        has_inv_continuity = has_data(cables, "inv_continuity")
+        
+        if(has_inv_continuity):
+            inv_continuity_master = build_master_dataframe(cables, "inv_continuity")[0]
+            csv_str = inv_continuity_master.to_csv(index=False)
+            st.download_button(
+                label="Download Master Inverse Continuity CSV",
+                data=csv_str,
+                file_name="inv_continuity_master.csv",
+                mime="text/csv",
+                key="download_inv_continuity_csv",
+            )
         st.divider()
-        has_inverse_continuity = any(
-            getattr(cable, "inv_continuity", None) is not None
-            and not getattr(cable.inv_continuity, "empty", True)
-            for cable in cables
-        )
-        if(has_inverse_continuity):
-            continuity_master = build_master_dataframe(cables, "inv_continuity")[0]
-        inverse_continuity_master_failures = []
+
+        #generate failure table 
+        inv_continuity_master_failures = []
         for cable in cables.values():
             fail_df = cable.inv_continuity_errors
             if cable.inv_continuity is not None:
                 if fail_df is not None and not fail_df.empty:
-                    inverse_continuity_master_failures.append(fail_df.copy())
+                    inv_continuity_master_failures.append(fail_df.copy())
+
+            
+            if fail_df is not None:
+                cat_df = cable.map_defects_to_order(fail_df)
+                discrete_fig = cable.category_heatmap(cat_df)
+                #st.plotly_chart(discrete_fig, use_container_width=True)
                     
-        if inverse_continuity_master_failures:
-            master_df = pd.concat(inverse_continuity_master_failures, ignore_index=True)
+        if inv_continuity_master_failures:
 
-
+            master_df = pd.concat(inv_continuity_master_failures, ignore_index=True)
             master_df["Category"] = master_df["Detail"].apply(bucket_reason)
             fig_overall, fig_stacked = DCR_continuity_histograms(master_df)
 
-            st.subheader("inverse continuity Failure Summary")
+            st.subheader("Inverse Continuity Failure Summary")
             st.plotly_chart(fig_overall, use_container_width=True)
             st.plotly_chart(fig_stacked, use_container_width=True)
-
             st.divider()
 
 
-        #generate failure table 
-        if "inverse_continuity_figs" not in st.session_state:
-            st.session_state.inverse_continuity_figs = {}
-        #generate master csv etc 
-
-
-        COL_LAYOUT = [1, 1, 5, 1]
+        if "inv_continuity_figs" not in st.session_state:
+            st.session_state.inv_continuity_figs = {}  # numeric heatmaps per serial_number
+        if "inv_continuity_defect_figs" not in st.session_state:
+            st.session_state.inv_continuity_defect_figs = {}
+        COL_LAYOUT = [1, 1, 4, 4, 1.5]  # SN | Length | Heatmap | Defect Map | Download
         st.subheader("Processed Cables")
+
+        header_cols = st.columns(COL_LAYOUT)
 
         header_cols = st.columns(COL_LAYOUT)
         header_cols[0].markdown("**Serial Number**")
         header_cols[1].markdown("**Length (in)**")
         header_cols[2].markdown("**Heatmap**")
-        header_cols[3].markdown("**Download CSV**")
-        #find all the cables with continuity data and create the buttons for the heatmap data
+        header_cols[3].markdown("**Defect Map**")
+        header_cols[4].markdown("**Download CSV**")
+
+        #find all the cables with inverse continuity data and create the buttons for the heatmap data
         # generate the master dataframe so histogram can be made etc 
 
+        inv_continuity_master_failures = []  # list of DataFrames
         for cable in cables.values():
             cols = st.columns(COL_LAYOUT)
-            fig_slot = cols[2].container()
             has_df = (cable.inv_continuity is not None)            
 
-            if(has_df):      
-                fig_exists = cable.serial_number in st.session_state.inverse_continuity_figs
+
+            heat_fig_slot = cols[2].container()
+            defect_fig_slot = cols[3].container()
+
+            if(has_df):
                 cols[0].markdown(cable.serial_number)
                 cols[1].markdown(cable.length)
-                if(not fig_exists):
+                
+                heatmap_exists = cable.serial_number in st.session_state.inv_continuity_figs
+                if not heatmap_exists:
                     if cols[2].button(
                         "Generate Heatmap",
-                        key=f"inverse_continuity_heatmap_{cable.serial_number}",
+                        key=f"inv_continuity_heatmap_{cable.serial_number}",
                     ):
-                        #continuity _ heatmap 
                         fig = cable.continuity_heatmap("inverse")
-                        st.session_state.inverse_continuity_figs[cable.serial_number] = fig
+                        st.session_state.inv_continuity_figs[cable.serial_number] = fig
+                        # Immediately display it
+                        heat_fig_slot.plotly_chart(fig, use_container_width=True)
                 else:
-                    cols[2].markdown("<span style='color:gray'>Heatmap generated ✔</span>", unsafe_allow_html=True)
+                    cols[2].markdown(
+                        "<span style='color:gray'>Heatmap generated ✔</span>",
+
+                        unsafe_allow_html=True
+                    )
+
+                stored_heat = st.session_state.inv_continuity_figs.get(cable.serial_number)
+                if stored_heat is not None:
+                    heat_fig_slot.plotly_chart(stored_heat, use_container_width=True, key=f"continuity_heat_{cable.serial_number}")
+
+                    
+                defect_exists = cable.serial_number in st.session_state.inv_continuity_defect_figs
+                if not defect_exists:
+                    if cols[3].button(
+                        "Generate Defect Map",
+                        key=f"inv_continuity_defect_{cable.serial_number}",
+                    ):
+                        fail_df = getattr(cable, "inv_continuity_errors", None)
+                        if fail_df is None:
+                            # Allow blank category map if no failures yet
+                            fail_df = pd.DataFrame(columns=["Channel", "Detail"])
+
+                        cat_df = cable.map_defects_to_order(fail_df)  # returns ["Channel","Category"]
+                        defect_fig = cable.category_heatmap(cat_df)
+                        st.session_state.inv_continuity_defect_figs[cable.serial_number] = defect_fig
+                        # Immediately display it
+                        defect_fig_slot.plotly_chart(defect_fig, use_container_width=True)
+                else:
+                    cols[3].markdown(
+                        "<span style='color:gray'>Defect map generated ✔</span>",
+                        unsafe_allow_html=True
+                    )
+
+                    stored_defect = st.session_state.inv_continuity_defect_figs.get(cable.serial_number)
+                    if stored_defect is not None:
+                        defect_fig_slot.plotly_chart(stored_defect, use_container_width=True, key=f"inv_continuity_defect_{cable.serial_number}")
 
 
-                if cols[3].button(
-                    "download csv",
-                    key=f"inverse_continuity_csv_{cable.serial_number}",
-                ):
-                    print("hello world")
-            
-            stored_fig = st.session_state.inverse_continuity_figs.get(cable.serial_number)
-            if stored_fig is not None:
-                fig_slot.plotly_chart(stored_fig, use_container_width=True, key=f"inverse_continuity_fig{cable.serial_number}")
+                safe_sn = str(cable.serial_number).strip()
+                safe_len = str(int(cable.length)) if isinstance(cable.length, (int, float)) else str(cable.length).strip()
+
+                base_dir = Path("temp") / safe_len / safe_sn
+                name = f"inv_continuity_{safe_len}_{safe_sn}.csv"
+                temp_path = base_dir / name
+                                    
+                if temp_path.exists():
+                    csv_bytes = temp_path.read_bytes()
+                    cols[4].download_button(
+                        label="Download CSV",
+                        data=csv_bytes,
+                        file_name=name,    # user-facing filename
+                        mime="text/csv",
+                        key=f"inv_continuity_{cable.serial_number}",
+                    )
+                else:
+                    cols[4].markdown(
+                        "<span style='color:crimson'>Missing temp file</span>",
+                        unsafe_allow_html=True
+                    )
+        
+            stored_fig = st.session_state.inv_continuity_figs.get(cable.serial_number)
     with DCR_Tab:
         st.subheader("DC Resistance")
-        has_DCR = any(
-            getattr(cable, "resistance", None) is not None
-            and not getattr(cable.resistance, "empty", True)
-            for cable in cables
-        )
+        has_DCR = has_data(cables, "DCR")
         if(has_DCR):
             DCR_master = build_master_dataframe(cables, "resistance")[0]
-        dcr_master_failures = []
+            csv_str = DCR_master.to_csv(index=False)
+            st.download_button(
+                label="Download Master DCR CSV",
+                data=csv_str,
+                file_name="DCR_master.csv",
+                mime="text/csv",
+                key="download_DCR_csv",
+            )
+        st.divider()
+
+        #generate failure table 
+        DCR_master_failures = []
         for cable in cables.values():
             fail_df = cable.resistance_errors
             if cable.resistance is not None:
                 if fail_df is not None and not fail_df.empty:
-                    dcr_master_failures.append(fail_df.copy())
+                    DCR_master_failures.append(fail_df.copy())
+
+            
+            if fail_df is not None:
+                cat_df = cable.map_defects_to_order(fail_df)
+                discrete_fig = cable.category_heatmap(cat_df)
+                #st.plotly_chart(discrete_fig, use_container_width=True)
                     
-        if dcr_master_failures:
-            master_df = pd.concat(dcr_master_failures, ignore_index=True)
+        if DCR_master_failures:
 
-
+            master_df = pd.concat(DCR_master_failures, ignore_index=True)
             master_df["Category"] = master_df["Detail"].apply(bucket_reason)
-            print(master_df)
             fig_overall, fig_stacked = DCR_continuity_histograms(master_df)
 
             st.subheader("DCR Failure Summary")
             st.plotly_chart(fig_overall, use_container_width=True)
             st.plotly_chart(fig_stacked, use_container_width=True)
-
             st.divider()
 
 
-        #generate master csv 
-        #create tables of failures 
         if "DCR_figs" not in st.session_state:
-            st.session_state.DCR_figs = {}
-        #create histogram of failure type
-
-
-        COL_LAYOUT = [1, 1, 5, 1]
+            st.session_state.DCR_figs = {}  # numeric heatmaps per serial_number
+        if "DCR_defect_figs" not in st.session_state:
+            st.session_state.DCR_defect_figs = {}
+        COL_LAYOUT = [1, 1, 4, 4, 1.5]  # SN | Length | Heatmap | Defect Map | Download
         st.subheader("Processed Cables")
+
+        header_cols = st.columns(COL_LAYOUT)
+
         header_cols = st.columns(COL_LAYOUT)
         header_cols[0].markdown("**Serial Number**")
         header_cols[1].markdown("**Length (in)**")
         header_cols[2].markdown("**Heatmap**")
-        header_cols[3].markdown("**Download CSV**")
+        header_cols[3].markdown("**Defect Map**")
+        header_cols[4].markdown("**Download CSV**")
+
         #find all the cables with continuity data and create the buttons for the heatmap data
         # generate the master dataframe so histogram can be made etc 
+
+        DCR_master_failures = []  # list of DataFrames
         for cable in cables.values():
+            cols = st.columns(COL_LAYOUT)
             has_df = (cable.resistance is not None)            
 
-            fig_slot = cols[2].container()
+
+            heat_fig_slot = cols[2].container()
+            defect_fig_slot = cols[3].container()
 
             if(has_df):
-                fig_exists = cable.serial_number in st.session_state.DCR_figs
                 cols[0].markdown(cable.serial_number)
                 cols[1].markdown(cable.length)
-                if(not fig_exists):
+                
+                heatmap_exists = cable.serial_number in st.session_state.DCR_figs
+                if not heatmap_exists:
                     if cols[2].button(
                         "Generate Heatmap",
-                        key=f"DCR_heatmap{cable.serial_number}",
+                        key=f"DCR_heatmap_{cable.serial_number}",
                     ):
                         fig = cable.DCR_heatmap("forward")
                         st.session_state.DCR_figs[cable.serial_number] = fig
-
+                        # Immediately display it
+                        heat_fig_slot.plotly_chart(fig, use_container_width=True)
                 else:
-                    cols[2].markdown("<span style='color:gray'>Heatmap generated ✔</span>", unsafe_allow_html=True)
+                    cols[2].markdown(
+                        "<span style='color:gray'>Heatmap generated ✔</span>",
 
-                if cols[3].button(
-                    "download csv",
-                    key=f"DCR_csv_{cable.serial_number}",
-                ):
-                    print("hello world")
-            #find the reasons each board failed from the dataset 
-            stored_fig = st.session_state.DCR_figs.get(cable.serial_number)
-            if stored_fig is not None:
-                fig_slot.plotly_chart(stored_fig, use_container_width=True,key=f"DCR_fig{cable.serial_number}")
+                        unsafe_allow_html=True
+                    )
+
+                    stored_heat = st.session_state.DCR_figs.get(cable.serial_number)
+                    if stored_heat is not None:
+                        heat_fig_slot.plotly_chart(stored_heat, use_container_width=True, key=f"DCR_heat_{cable.serial_number}")
+
+                        
+                defect_exists = cable.serial_number in st.session_state.DCR_defect_figs
+                if not defect_exists:
+                    if cols[3].button(
+                        "Generate Defect Map",
+                        key=f"DCR_defect_{cable.serial_number}",
+                    ):
+                        fail_df = getattr(cable, "resistance_errors", None)
+                        if fail_df is None:
+                            # Allow blank category map if no failures yet
+                            fail_df = pd.DataFrame(columns=["Channel", "Detail"])
+
+                        cat_df = cable.map_defects_to_order(fail_df)  # returns ["Channel","Category"]
+                        defect_fig = cable.category_heatmap(cat_df)
+                        st.session_state.DCR_defect_figs[cable.serial_number] = defect_fig
+                        # Immediately display it
+                        defect_fig_slot.plotly_chart(defect_fig, use_container_width=True)
+                else:
+                    cols[3].markdown(
+                        "<span style='color:gray'>Defect map generated ✔</span>",
+                        unsafe_allow_html=True
+                    )
+
+                    stored_defect = st.session_state.DCR_defect_figs.get(cable.serial_number)
+                    if stored_defect is not None:
+                        defect_fig_slot.plotly_chart(stored_defect, use_container_width=True, key=f"DCR_defect_{cable.serial_number}")
+
+                    
+                safe_sn = str(cable.serial_number).strip()
+                safe_len = str(int(cable.length)) if isinstance(cable.length, (int, float)) else str(cable.length).strip()
+
+                base_dir = Path("temp") / safe_len / safe_sn
+                name = f"resistance_{safe_len}_{safe_sn}.csv"
+                temp_path = base_dir / name
+                                    
+                if temp_path.exists():
+                    csv_bytes = temp_path.read_bytes()
+                    cols[4].download_button(
+                        label="Download CSV",
+                        data=csv_bytes,
+                        file_name=name,    # user-facing filename
+                        mime="text/csv",
+                        key=f"DCR_csv_{cable.serial_number}",
+                    )
+                else:
+                    cols[4].markdown(
+                        "<span style='color:crimson'>Missing temp file</span>",
+                        unsafe_allow_html=True
+                    )
+
+                stored_fig = st.session_state.DCR_figs.get(cable.serial_number)
     with Inverse_DCR_Tab:
-        st.subheader("Inverse DC Resistance")
-        has_inverse_DCR = any(
-            getattr(cable, "inv_resistance", None) is not None
-            and not getattr(cable.inv_resistance, "empty", True)
-            for cable in cables
-        )
-        if(has_inverse_DCR):
-            inverse_DCR_master = build_master_dataframe(cables, "inv_resistance")[0]
-        #generate master csv 
-        inverse_dcr_master_failures = []
+        st.subheader("Inverse DCR")
+        has_inv_DCR = has_data(cables, "inv_DCR")
+
+        if(has_inv_DCR):
+            inv_DCR_master = build_master_dataframe(cables, "inv_resistance")[0]
+            csv_str = inv_DCR_master.to_csv(index=False)
+            st.download_button(
+                label="Download Master inverse DCR CSV",
+                data=csv_str,
+                file_name="inv_DCR_master.csv",
+                mime="text/csv",
+                key="download_inv_DCR_csv",
+            )
+        st.divider()
+
+        #generate failure table 
+        inv_DCR_master_failures = []
         for cable in cables.values():
             fail_df = cable.inv_resistance_errors
             if cable.inv_resistance is not None:
                 if fail_df is not None and not fail_df.empty:
-                    inverse_dcr_master_failures.append(fail_df.copy())
+                    inv_DCR_master_failures.append(fail_df.copy())
+
+            
+            if fail_df is not None:
+                cat_df = cable.map_defects_to_order(fail_df)
+                discrete_fig = cable.category_heatmap(cat_df)
+                #st.plotly_chart(discrete_fig, use_container_width=True)
                     
-        if inverse_dcr_master_failures:
-            master_df = pd.concat(inverse_dcr_master_failures, ignore_index=True)
+        if inv_DCR_master_failures:
 
-
+            master_df = pd.concat(inv_DCR_master_failures, ignore_index=True)
             master_df["Category"] = master_df["Detail"].apply(bucket_reason)
-            print(master_df)
             fig_overall, fig_stacked = DCR_continuity_histograms(master_df)
 
             st.subheader("Inverse DCR Failure Summary")
             st.plotly_chart(fig_overall, use_container_width=True)
             st.plotly_chart(fig_stacked, use_container_width=True)
-
             st.divider()
-        if "inverse_DCR_figs" not in st.session_state:
-            st.session_state.inverse_DCR_figs = {}
-        #create tables of failures 
-        #create histogram of failure type
-        st.divider()
 
-        COL_LAYOUT = [1, 1, 5, 1]
+
+        if "inv_DCR_figs" not in st.session_state:
+            st.session_state.inv_DCR_figs = {}  # numeric heatmaps per serial_number
+        if "inv_DCR_defect_figs" not in st.session_state:
+            st.session_state.inv_DCR_defect_figs = {}
+        COL_LAYOUT = [1, 1, 4, 4, 1.5]  # SN | Length | Heatmap | Defect Map | Download
         st.subheader("Processed Cables")
+
+        header_cols = st.columns(COL_LAYOUT)
+
         header_cols = st.columns(COL_LAYOUT)
         header_cols[0].markdown("**Serial Number**")
         header_cols[1].markdown("**Length (in)**")
         header_cols[2].markdown("**Heatmap**")
-        header_cols[3].markdown("**Download CSV**")
-        #find all the cables with continuity data and create the buttons for the heatmap data
+        header_cols[3].markdown("**Defect Map**")
+        header_cols[4].markdown("**Download CSV**")
+
+        #find all the cables with inverse continuity data and create the buttons for the heatmap data
         # generate the master dataframe so histogram can be made etc 
-        inverse_dcr_master_failures = []
+
+        inv_DCR_master_failures = []  # list of DataFrames
         for cable in cables.values():
             cols = st.columns(COL_LAYOUT)
             has_df = (cable.inv_resistance is not None)            
-            fig_slot = cols[2].container()
-            fig_exists = cable.serial_number in st.session_state.inverse_DCR_figs
+
+
+            heat_fig_slot = cols[2].container()
+            defect_fig_slot = cols[3].container()
 
             if(has_df):
                 cols[0].markdown(cable.serial_number)
                 cols[1].markdown(cable.length)
-                if(not fig_exists):
+                
+                heatmap_exists = cable.serial_number in st.session_state.inv_DCR_figs
+                if not heatmap_exists:
                     if cols[2].button(
                         "Generate Heatmap",
-                        key=f"inverse_DCR_heatmap{cable.serial_number}",
+                        key=f"inv_DCR_heatmap_{cable.serial_number}",
                     ):
-                        fig = cable.DCR_heatmap("inverse")
-                        st.session_state.inverse_DCR_figs[cable.serial_number] = fig
+                        fig = cable.DCR_heatmap(cable, "inverse")
+                        st.session_state.inv_DCR_figs[cable.serial_number] = fig
+                        # Immediately display it
+                        heat_fig_slot.plotly_chart(fig, use_container_width=True)
                 else:
-                    cols[2].markdown("<span style='color:gray'>Heatmap generated ✔</span>", unsafe_allow_html=True)
+                    cols[2].markdown(
+                        "<span style='color:gray'>Heatmap generated ✔</span>",
 
+                        unsafe_allow_html=True
+                    )
 
+                    stored_heat = st.session_state.inv_DCR_figs.get(cable.serial_number)
+                    if stored_heat is not None:
+                        heat_fig_slot.plotly_chart(stored_heat, use_container_width=True, key=f"DCR_heat_{cable.serial_number}")
 
-                if cols[3].button(
-                    "download csv",
-                    key=f"inverse_DCR_csv_{cable.serial_number}",
-                ):
-                    print("hello world")
-            #find the reasons each board failed from the dataset 
-            stored_fig = st.session_state.inverse_DCR_figs.get(cable.serial_number)
-            if stored_fig is not None:
-                fig_slot.plotly_chart(stored_fig, use_container_width=True, key=f"inverse_DCR_fig{cable.serial_number}")
+                        
+                defect_exists = cable.serial_number in st.session_state.inv_DCR_defect_figs
+                if not defect_exists:
+                    if cols[3].button(
+                        "Generate Defect Map",
+                        key=f"inv_DCR_defect_{cable.serial_number}",
+                    ):
+                        fail_df = getattr(cable, "inv_DCR_errors", None)
+                        if fail_df is None:
+                            # Allow blank category map if no failures yet
+                            fail_df = pd.DataFrame(columns=["Channel", "Detail"])
+
+                        cat_df = cable.map_defects_to_order(fail_df)  # returns ["Channel","Category"]
+                        defect_fig = cable.category_heatmap(cat_df)
+                        st.session_state.inv_DCR_defect_figs[cable.serial_number] = defect_fig
+                        # Immediately display it
+                        defect_fig_slot.plotly_chart(defect_fig, use_container_width=True)
+                else:
+                    cols[3].markdown(
+                        "<span style='color:gray'>Defect map generated ✔</span>",
+                        unsafe_allow_html=True
+                    )
+
+                    stored_defect = st.session_state.inv_DCR_defect_figs.get(cable.serial_number)
+                    if stored_defect is not None:
+                        defect_fig_slot.plotly_chart(stored_defect, use_container_width=True, key=f"inv_DCR_defect_{cable.serial_number}")
+
+                safe_sn = str(cable.serial_number).strip()
+                safe_len = str(int(cable.length)) if isinstance(cable.length, (int, float)) else str(cable.length).strip()
+
+                base_dir = Path("temp") / safe_len / safe_sn
+                name = f"inv_resistance_{safe_len}_{safe_sn}.csv"
+                temp_path = base_dir / name
+                                    
+                if temp_path.exists():
+                    csv_bytes = temp_path.read_bytes()
+                    cols[4].download_button(
+                        label="Download CSV",
+                        data=csv_bytes,
+                        file_name=name,    # user-facing filename
+                        mime="text/csv",
+                        key=f"inv_resistance_{cable.serial_number}",
+                    )
+                else:
+                    cols[4].markdown(
+                        "<span style='color:crimson'>Missing temp file</span>",
+                        unsafe_allow_html=True
+                    )
+
+        
+                stored_fig = st.session_state.inv_DCR_figs.get(cable.serial_number)
     with Leakage_1s_Tab:
         leakage_1s_master_failures = []
         # add the "master" histograms from before
@@ -597,10 +879,20 @@ if uploaded_files:
             if cable.leakage_1s is not None:
                 if fail_df is not None and not fail_df.empty:
                     leakage_1s_master_failures.append(fail_df.copy())
-        gen_master = any(c.leakage_1s is not None and not c.leakage_1s.empty for c in cables.values())        
+        gen_master = has_data(cables, "1s")
+
         if(gen_master):
             master_df = build_master_dataframe(cables, "leakage_1s")[0]
-            print(master_df)
+            csv_str = master_df.to_csv(index=False)
+            st.download_button(
+                label="Download Master 1s Leakage CSV",
+                data=csv_str,
+                file_name="1s_master.csv",
+                mime="text/csv",
+                key="download_1s_csv",
+            )
+            st.divider()
+
             fig_overall, fig_stacked = generate_leakage_histograms(master_df)
 
             st.subheader("1s leakage Summary")
@@ -609,7 +901,7 @@ if uploaded_files:
 
             st.divider()
         #leakage 1s heatmap and master dataframe    st.divider()
-        COL_LAYOUT = [1, 1, 5, 1]
+        COL_LAYOUT = [1, 1, 5, 1.5]
         st.subheader("Processed Cables")
         has_leakage_1s = any(
             getattr(cable, "leakage_1s", None) is not None
@@ -647,35 +939,55 @@ if uploaded_files:
                 
                 else:
                     cols[2].markdown("<span style='color:gray'>Heatmap generated ✔</span>", unsafe_allow_html=True)
-        
-                if cols[3].button(
-                    "download csv",
-                    key=f"leakage_1s_csv_{cable.serial_number}",
-                ):
-                    print("hello world")
 
-                    #exit()
-                    #continuity _ heatmap 
-                    #display heatmap 
-            
-            stored_fig = st.session_state.leakage_1s_figs.get(cable.serial_number)
-            if stored_fig is not None:
-                fig_slot.plotly_chart(stored_fig, use_container_width=True, key=f"leakage_1s_fig{cable.serial_number}")
+                safe_sn = str(cable.serial_number).strip()
+                safe_len = str(int(cable.length)) if isinstance(cable.length, (int, float)) else str(cable.length).strip()
+
+                base_dir = Path("temp") / safe_len / safe_sn
+                name = f"leakage_1s_{safe_len}_{safe_sn}.csv"
+                temp_path = base_dir / name
+                                    
+                if temp_path.exists():
+                    csv_bytes = temp_path.read_bytes()
+                    cols[4].download_button(
+                        label="Download CSV",
+                        data=csv_bytes,
+                        file_name=name,    # user-facing filename
+                        mime="text/csv",
+                        key=f"leakage_1s_{cable.serial_number}",
+                    )
+                else:
+                    cols[4].markdown(
+                        "<span style='color:crimson'>Missing temp file</span>",
+                        unsafe_allow_html=True
+                    )
+        
+                stored_fig = st.session_state.leakage_1s_figs.get(cable.serial_number)
+                if stored_fig is not None:
+                    fig_slot.plotly_chart(stored_fig, use_container_width=True, key=f"leakage_1s_fig{cable.serial_number}")
 
     with Final_Leakage_Tab:
         #add the "master" histograms from before using the same logic
         st.subheader("Final Leakage")
-        st.divider()
         for cable in cables.values():
             fail_df = cable.leakage_1s_errors
             if cable.leakage_1s is not None:
                 if fail_df is not None and not fail_df.empty:
                     leakage_1s_master_failures.append(fail_df.copy())
-        gen_master = any(c.leakage is not None and not c.leakage.empty for c in cables.values())        
+        gen_master = has_data(cables, "leakage")
+
         if(gen_master):
             master_df = build_master_dataframe(cables, "leakage")[0]
-            print(type(master_df))
-            print(master_df)
+            csv_str = master_df.to_csv(index=False)
+            st.download_button(
+                label="Download Master Leakage CSV",
+                data=csv_str,
+                file_name="leakage_master.csv",
+                mime="text/csv",
+                key="download_leakage_csv",
+            )
+            st.divider()
+
             fig_overall, fig_stacked = generate_leakage_histograms(master_df)
 
             st.subheader("leakage Summary")
@@ -684,7 +996,7 @@ if uploaded_files:
 
             st.divider()
 
-        COL_LAYOUT = [1, 1, 5, 1]
+        COL_LAYOUT = [1, 1, 5, 1.5]
         st.subheader("Processed Cables")
         
         if "leakage_figs" not in st.session_state:
@@ -720,17 +1032,29 @@ if uploaded_files:
                 else:
                     cols[2].markdown("<span style='color:gray'>Heatmap generated ✔</span>", unsafe_allow_html=True)
 
-                    
-                if cols[3].button(
-                    "download csv",
-                    key=f"final_leakage_csv_{cable.serial_number}",
-                ):
-                    print("hello world")
 
-                    #exit()
-                    #continuity _ heatmap 
-                    #display heatmap 
+                safe_sn = str(cable.serial_number).strip()
+                safe_len = str(int(cable.length)) if isinstance(cable.length, (int, float)) else str(cable.length).strip()
 
-            stored_fig = st.session_state.leakage_figs.get(cable.serial_number)
-            if stored_fig is not None:
-                fig_slot.plotly_chart(stored_fig, use_container_width=True, key=f"final_leakage_fig{cable.serial_number}")
+                base_dir = Path("temp") / safe_len / safe_sn
+                name = f"leakage_{safe_len}_{safe_sn}.csv"
+                temp_path = base_dir / name
+                                    
+                if temp_path.exists():
+                    csv_bytes = temp_path.read_bytes()
+                    cols[4].download_button(
+                        label="Download CSV",
+                        data=csv_bytes,
+                        file_name=name,    # user-facing filename
+                        mime="text/csv",
+                        key=f"final_leakage_csv_{cable.serial_number}",
+                    )
+                else:
+                    cols[4].markdown(
+                        "<span style='color:crimson'>Missing temp file</span>",
+                        unsafe_allow_html=True
+                    )
+
+                stored_fig = st.session_state.leakage_figs.get(cable.serial_number)
+                if stored_fig is not None:
+                    fig_slot.plotly_chart(stored_fig, use_container_width=True, key=f"final_leakage_fig{cable.serial_number}")

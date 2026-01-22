@@ -614,5 +614,191 @@ class Cable:
         )
 
         return fig
+    
+    def bucket_reason(self, text: str) -> str:
+        t = text.lower()
+        if "shorted" in t:
+            return "Shorted"
+        if "miswire" in t:
+            return "Miswire"
+        if "high" in t:
+            return "High"
+        if "open" in t:
+            return "Open"
+        if "missing" in t:
+            return "Wire Missing"
+        return "Other"
+        
+    
+    def map_defects_to_order(self, error_df):
+        # Assign a bucket category to each row (only where Detail exists)
+        error_df["Category"] = error_df["Detail"].apply(
+            lambda x: self.bucket_reason(x) if pd.notna(x) else ""
+        )
+
+        # Keep only unique channels (first occurrence)
+        df_idx = (
+            error_df.drop_duplicates(subset="Channel", keep="first")
+            .set_index("Channel")
+        )
+
+        # Reindex to your fixed order — missing channels become NaN
+        ordered = df_idx.reindex(self.order)
+        
+        ordered = ordered[["Category"]].reset_index()
+
+        # Make Category blank instead of NaN
+        ordered["Category"] = ordered["Category"].fillna("")
+
+        print(ordered)
+
+        return ordered
+
+
+    def category_heatmap(self, categories_df):
+        """
+        Render a 4-row categorical heatmap (Top, TopS, BottomS, Bottom) where each cell
+        shows the defect Category for that channel. Missing channels render as blank.
+        Expects categories_df with columns ["Channel", "Category"].
+        """
+
+        # Map Channel -> Category (first occurrence wins)
+        cat_map = (
+            categories_df.drop_duplicates("Channel", keep="first")
+            .set_index("Channel")["Category"]
+            .to_dict()
+        )
+
+        # Build 1×N label rows aligned to each section; blank "" if not present
+        top_labels     = np.array([cat_map.get(ch, "") for ch in self.Top], dtype=object).reshape(1, -1)
+        topS_labels    = np.array([cat_map.get(ch, "") for ch in self.TopS], dtype=object).reshape(1, -1)
+        bottomS_labels = np.array([cat_map.get(ch, "") for ch in self.BottomS], dtype=object).reshape(1, -1)
+        bottom_labels  = np.array([cat_map.get(ch, "") for ch in self.Bottom], dtype=object).reshape(1, -1)
+
+        # Determine categories → codes, with "" (blank) as 0
+        cats = categories_df["Category"].dropna().unique().tolist()
+        cats = [c for c in cats if c != ""]
+        categories = [""] + cats
+        cat_to_code = {c: i for i, c in enumerate(categories)}
+        code_to_cat = {i: c for c, i in cat_to_code.items()}
+
+        # Encode to integer codes
+        enc = np.vectorize(lambda x: cat_to_code.get(x, 0))
+        top_codes     = enc(top_labels).astype(int)
+        topS_codes    = enc(topS_labels).astype(int)
+        bottomS_codes = enc(bottomS_labels).astype(int)
+        bottom_codes  = enc(bottom_labels).astype(int)
+
+        # Build a discrete colorscale (first color is for blank/no defect)
+        palette = [
+            "#e6e6e6",  # "" blank
+            "#1f77b4",  # cat 1
+            "#ff7f0e",  # cat 2
+            "#2ca02c",  # cat 3
+            "#d62728",  # cat 4
+            "#9467bd",  # (extra if more than 4)
+            "#8c564b",
+            "#e377c2",
+            "#7f7f7f",
+            "#bcbd22",
+            "#17becf",
+        ]
+        if len(categories) > len(palette):
+            raise ValueError(f"Add more colors to the palette (need {len(categories)}).")
+
+        n = len(categories)
+        cmin, cmax = -0.5, n - 0.5
+        colorscale = []
+        if n == 1:
+            colorscale = [(0.0, palette[0]), (1.0, palette[0])]
+        else:
+            # flat steps: duplicate each stop so no gradient between codes
+            for i in range(n):
+                pos = i / (n - 1)
+                colorscale.append((pos, palette[i]))
+                colorscale.append((min(pos + 1e-6, 1.0), palette[i]))
+
+        # Create the 4-row subplot
+        fig = make_subplots(
+            rows=4, cols=1,
+            shared_xaxes=False,
+            vertical_spacing=0.2,
+            row_heights=[0.38, 0.09, 0.09, 0.38],
+        )
+
+        # Row 1: Top (show legend/colorbar here only)
+        fig.add_trace(
+            go.Heatmap(
+                z=top_codes, x=self.Top, y=[""],
+                zmin=cmin, zmax=cmax, colorscale=colorscale,
+                colorbar=dict(
+                    title="Category",
+                    tickmode="array",
+                    tickvals=list(range(n)),
+                    ticktext=[code_to_cat[i] for i in range(n)],
+                ),
+                showscale=False,
+            ),
+            row=1, col=1
+        )
+
+        # Row 2: TopS
+        fig.add_trace(
+            go.Heatmap(
+                z=topS_codes, x=self.TopS, y=[""],
+                zmin=cmin, zmax=cmax, colorscale=colorscale,
+                showscale=False,
+            ),
+            row=2, col=1
+        )
+
+        # Row 3: BottomS
+        fig.add_trace(
+            go.Heatmap(
+                z=bottomS_codes, x=self.BottomS, y=[""],
+                zmin=cmin, zmax=cmax, colorscale=colorscale,
+                showscale=False,
+            ),
+            row=3, col=1
+        )
+
+        # Row 4: Bottom
+        fig.add_trace(
+            go.Heatmap(
+                z=bottom_codes, x=self.Bottom, y=[""],
+                zmin=cmin, zmax=cmax, colorscale=colorscale,
+                showscale=False,
+            ),
+            row=4, col=1
+        )
+
+        # Axes: Top/TopS labels above; BottomS/Bottom below; rotate ticks
+        fig.update_xaxes(side="top",    tickangle=90, row=1, col=1)
+        fig.update_xaxes(side="top",    tickangle=90, row=2, col=1)
+        fig.update_xaxes(side="bottom", tickangle=90, row=3, col=1)
+        fig.update_xaxes(side="bottom", tickangle=90, row=4, col=1)
+        for r in (1, 2, 3, 4):
+            fig.update_yaxes(title="", row=r, col=1)
+
+        fig.update_layout(
+            title=f"Categorical defect map for SN: {self.serial_number}",
+            margin=dict(l=40, r=40, t=90, b=70),
+            height=400,
+        )
+        
+        for i, cat in enumerate(categories):
+            fig.add_trace(
+                go.Scatter(
+                    x=[None], y=[None],
+                    mode="markers",
+                    marker=dict(size=12, color=palette[i]),
+                    legendgroup=cat,
+                    showlegend=True,
+                    name=cat if cat != "" else "No Defect"
+                )
+            )
+
+        return fig
+
 
 
